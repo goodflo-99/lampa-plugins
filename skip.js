@@ -9,20 +9,26 @@
 		card: null,
 		db: null,
 		playlist: null,
+
 		baseSeason: 1,
 		baseEpisode: 1,
 		baseIndex: 0,
+
 		lastIndex: -1,
 		lastUrl: null,
+
 		activeEpisodeKey: null,
 		activeSegments: [],
 		skippedMarks: {},
-		videoBound: false,
-		observerStarted: false
+
+		observerStarted: false,
+		skipWatcherStarted: false,
+		timelineWatcherStarted: false,
+		styleInjected: false
 	};
 
-	function hasExistingSegments(obj) {
-		return obj && obj.segments && obj.segments.skip && obj.segments.skip.length > 0;
+	function hasSkipSegments(obj) {
+		return !!(obj && obj.segments && Array.isArray(obj.segments.skip) && obj.segments.skip.length);
 	}
 
 	function getKpId(card) {
@@ -67,16 +73,11 @@
 				start = Number(seg[0]);
 				end = Number(seg[1]);
 			} else if (seg && typeof seg === "object") {
-				start = Number(
-					seg.start ?? seg.from ?? seg.begin ?? seg.time ?? seg[0]
-				);
-				end = Number(
-					seg.end ?? seg.to ?? seg.stop ?? seg[1]
-				);
+				start = Number(seg.start ?? seg.from ?? seg.begin ?? seg.time ?? seg[0]);
+				end = Number(seg.end ?? seg.to ?? seg.stop ?? seg[1]);
 			}
 
-			if (!isFinite(start) || !isFinite(end)) return null;
-			if (end <= start) return null;
+			if (!isFinite(start) || !isFinite(end) || end <= start) return null;
 
 			return {
 				id: index,
@@ -90,7 +91,8 @@
 		if (videoParams.episode || videoParams.e || videoParams.episode_number) {
 			return {
 				season: parseInt(videoParams.season || videoParams.s || defaultSeason || 1),
-				episode: parseInt(videoParams.episode || videoParams.e || videoParams.episode_number)
+				episode: parseInt(videoParams.episode || videoParams.e || videoParams.episode_number),
+				index: 0
 			};
 		}
 
@@ -107,7 +109,11 @@
 			}
 		}
 
-		return { season: defaultSeason || 1, episode: 1, index: 0 };
+		return {
+			season: parseInt(defaultSeason || 1),
+			episode: 1,
+			index: 0
+		};
 	}
 
 	function detectCurrentUrl() {
@@ -118,7 +124,7 @@
 		}
 	}
 
-	function detectCurrentIndex() {
+	function detectCurrentIndexRaw() {
 		if (!state.playlist || !state.playlist.length) return -1;
 
 		let idx = state.playlist.findIndex(item => item && item.selected);
@@ -131,6 +137,13 @@
 		}
 
 		return -1;
+	}
+
+	function getCurrentIndexSafe() {
+		const idx = detectCurrentIndexRaw();
+		if (idx >= 0) return idx;
+		if (state.lastIndex >= 0) return state.lastIndex;
+		return state.baseIndex || 0;
 	}
 
 	function getEpisodeInfoByIndex(index) {
@@ -147,80 +160,179 @@
 		return {
 			item: item,
 			season: season,
-			episode: episode
+			episode: episode,
+			index: index
 		};
 	}
 
-	function setSegmentsForCurrentEpisode(index, notify) {
+	function clearItemSegments(item) {
+		if (!item || !item.segments) return;
+		if (item.segments.skip) delete item.segments.skip;
+		if (!Object.keys(item.segments).length) delete item.segments;
+	}
+
+	function setItemSegments(item, rawSegments) {
+		if (!item) return;
+
+		if (rawSegments && rawSegments.length > 0) {
+			item.segments = item.segments || {};
+			item.segments.skip = rawSegments.slice();
+		} else {
+			clearItemSegments(item);
+		}
+	}
+
+	function fillPlaylistAhead() {
+		if (!state.playlist || !state.db) return;
+
+		state.playlist.forEach(function (item, index) {
+			const info = getEpisodeInfoByIndex(index);
+			if (!info) return;
+
+			const raw = getSegmentsFromDb(state.db, info.season, info.episode);
+			setItemSegments(item, raw);
+		});
+	}
+
+	function setCurrentEpisodeSegments(index, notify) {
 		const info = getEpisodeInfoByIndex(index);
 		if (!info || !state.db) return;
 
-		const rawSegments = getSegmentsFromDb(state.db, info.season, info.episode);
-		const normalized = normalizeSegments(rawSegments);
-		const episodeKey = info.season + "|" + info.episode + "|" + index;
+		const raw = getSegmentsFromDb(state.db, info.season, info.episode);
+		const normalized = normalizeSegments(raw);
+		const key = info.season + "|" + info.episode + "|" + index;
 
-		state.activeEpisodeKey = episodeKey;
+		state.activeEpisodeKey = key;
 		state.activeSegments = normalized;
 		state.skippedMarks = {};
 
-		if (rawSegments && rawSegments.length > 0) {
-			info.item.segments = info.item.segments || {};
-			info.item.segments.skip = rawSegments.slice();
-		} else if (info.item.segments && info.item.segments.skip) {
-			delete info.item.segments.skip;
-			if (!Object.keys(info.item.segments).length) delete info.item.segments;
-		}
+		setItemSegments(info.item, raw);
+
+		try {
+			if (Lampa.Player && Lampa.Player.object) {
+				Lampa.Player.object.segments = Lampa.Player.object.segments || {};
+				if (raw && raw.length > 0) {
+					Lampa.Player.object.segments.skip = raw.slice();
+				} else if (Lampa.Player.object.segments.skip) {
+					delete Lampa.Player.object.segments.skip;
+				}
+			}
+		} catch (e) {}
 
 		if (notify) {
 			Lampa.Noty.show(
-				"Таймкоди: Сезон " + info.season + ", Серія " + info.episode + " — " + (normalized.length ? "OK" : "немає")
+				"Таймкоди: Сезон " + info.season + ", Серія " + info.episode + (normalized.length ? "" : " — немає")
 			);
 		}
+
+		scheduleTimelineRender();
 	}
 
-	function bindVideoListener() {
-		if (state.videoBound) return;
+	function injectTimelineStyle() {
+		if (state.styleInjected) return;
+		state.styleInjected = true;
 
-		const tryBind = function () {
+		const style = document.createElement("style");
+		style.textContent = `
+			.custom-skip-segment {
+				position: absolute;
+				top: 0;
+				bottom: 0;
+				border-radius: 999px;
+				pointer-events: none;
+				background: rgba(70, 170, 255, 0.65);
+				box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18);
+				z-index: 2;
+			}
+		`;
+		document.head.appendChild(style);
+	}
+
+	function renderTimelineSegments() {
+		try {
+			injectTimelineStyle();
+
+			const timeline = document.querySelector(".player-panel__timeline");
+			const video = Lampa.Player && Lampa.Player.video;
+
+			if (!timeline || !video) return;
+
+			timeline.querySelectorAll(".custom-skip-segment").forEach(el => el.remove());
+
+			const duration = Number(video.duration || 0);
+			if (!isFinite(duration) || duration <= 0) return;
+			if (!state.activeSegments || !state.activeSegments.length) return;
+
+			const pos = window.getComputedStyle(timeline).position;
+			if (!pos || pos === "static") {
+				timeline.style.position = "relative";
+			}
+
+			state.activeSegments.forEach(function (seg) {
+				const width = ((seg.end - seg.start) / duration) * 100;
+				const left = (seg.start / duration) * 100;
+
+				if (width <= 0) return;
+
+				const el = document.createElement("div");
+				el.className = "custom-skip-segment";
+				el.style.left = left + "%";
+				el.style.width = width + "%";
+				timeline.appendChild(el);
+			});
+		} catch (e) {}
+	}
+
+	function scheduleTimelineRender() {
+		setTimeout(renderTimelineSegments, 250);
+		setTimeout(renderTimelineSegments, 900);
+		setTimeout(renderTimelineSegments, 1800);
+	}
+
+	function startTimelineWatcher() {
+		if (state.timelineWatcherStarted) return;
+		state.timelineWatcherStarted = true;
+
+		setInterval(function () {
+			if (!state.activeSegments || !state.activeSegments.length) return;
+			renderTimelineSegments();
+		}, 1500);
+	}
+
+	function startRuntimeSkipWatcher() {
+		if (state.skipWatcherStarted) return;
+		state.skipWatcherStarted = true;
+
+		setInterval(function () {
 			try {
 				const video = Lampa.Player && Lampa.Player.video;
-				if (!video || typeof video.addEventListener !== "function") {
-					setTimeout(tryBind, 500);
-					return;
-				}
+				if (!video || !state.activeSegments || !state.activeSegments.length || !state.activeEpisodeKey) return;
 
-				video.addEventListener("timeupdate", function () {
-					if (!state.activeSegments || !state.activeSegments.length) return;
-					if (!state.activeEpisodeKey) return;
+				const currentTime = Number(video.currentTime || 0);
+				if (!isFinite(currentTime)) return;
 
-					const currentTime = Number(video.currentTime || 0);
-					if (!isFinite(currentTime)) return;
+				for (let i = 0; i < state.activeSegments.length; i++) {
+					const seg = state.activeSegments[i];
+					const markKey = state.activeEpisodeKey + "|" + seg.id;
 
-					for (let i = 0; i < state.activeSegments.length; i++) {
-						const seg = state.activeSegments[i];
-						const markKey = state.activeEpisodeKey + "|" + seg.id;
+					if (state.skippedMarks[markKey]) continue;
 
-						if (state.skippedMarks[markKey]) continue;
+					if (currentTime >= seg.start && currentTime < seg.end - 0.15) {
+						state.skippedMarks[markKey] = true;
 
-						if (currentTime >= seg.start && currentTime < seg.end - 0.2) {
-							state.skippedMarks[markKey] = true;
+						try {
+							video.currentTime = seg.end + 0.05;
+						} catch (e) {}
 
-							try {
-								video.currentTime = seg.end + 0.05;
-							} catch (e) {}
-
-							break;
-						}
+						break;
 					}
-				});
 
-				state.videoBound = true;
-			} catch (e) {
-				setTimeout(tryBind, 500);
-			}
-		};
-
-		tryBind();
+					if (state.skippedMarks[markKey] && currentTime < seg.start - 3) {
+						delete state.skippedMarks[markKey];
+					}
+				}
+			} catch (e) {}
+		}, 250);
 	}
 
 	function startObserver() {
@@ -230,16 +342,13 @@
 		setInterval(function () {
 			if (!state.playlist || !state.playlist.length || !state.db) return;
 
-			const idx = detectCurrentIndex();
+			const idx = detectCurrentIndexRaw();
 			const url = detectCurrentUrl();
 
-			if (idx !== state.lastIndex || url !== state.lastUrl) {
+			if (idx >= 0 && (idx !== state.lastIndex || url !== state.lastUrl)) {
 				state.lastIndex = idx;
 				state.lastUrl = url;
-
-				if (idx >= 0) {
-					setSegmentsForCurrentEpisode(idx, true);
-				}
+				setCurrentEpisodeSegments(idx, true);
 			}
 		}, 700);
 	}
@@ -262,10 +371,10 @@
 		state.card = card;
 		state.kpId = kpId;
 
-		const pos = detectPosition(videoParams, 1);
-		state.baseSeason = pos.season || 1;
-		state.baseEpisode = pos.episode || 1;
-		state.baseIndex = pos.index || 0;
+		const position = detectPosition(videoParams, 1);
+		state.baseSeason = position.season || 1;
+		state.baseEpisode = position.episode || 1;
+		state.baseIndex = position.index || 0;
 
 		state.db = await fetchFromGitHub(kpId);
 		if (!state.db) return;
@@ -274,35 +383,26 @@
 			state.playlist = videoParams.playlist;
 		}
 
-		const rawSegments = getSegmentsFromDb(state.db, state.baseSeason, state.baseEpisode);
+		fillPlaylistAhead();
 
-		if (rawSegments && rawSegments.length > 0) {
+		const raw = getSegmentsFromDb(state.db, state.baseSeason, state.baseEpisode);
+		if (raw && raw.length > 0) {
 			videoParams.segments = videoParams.segments || {};
-			videoParams.segments.skip = rawSegments.slice();
-
-			state.activeSegments = normalizeSegments(rawSegments);
-			state.activeEpisodeKey = state.baseSeason + "|" + state.baseEpisode + "|" + state.baseIndex;
-			state.skippedMarks = {};
-
+			videoParams.segments.skip = raw.slice();
 			Lampa.Noty.show("Таймкоди завантажено: Сезон " + state.baseSeason + ", Серія " + state.baseEpisode);
-		} else {
-			state.activeSegments = [];
-			state.activeEpisodeKey = state.baseSeason + "|" + state.baseEpisode + "|" + state.baseIndex;
-			state.skippedMarks = {};
+		} else if (videoParams.segments && videoParams.segments.skip) {
+			delete videoParams.segments.skip;
+			if (!Object.keys(videoParams.segments).length) delete videoParams.segments;
 		}
 
-		if (state.playlist && state.playlist[state.baseIndex]) {
-			const item = state.playlist[state.baseIndex];
-			if (rawSegments && rawSegments.length > 0) {
-				item.segments = item.segments || {};
-				item.segments.skip = rawSegments.slice();
-			}
-		}
+		state.lastIndex = state.baseIndex;
+		state.lastUrl = videoParams.url || null;
+		setCurrentEpisodeSegments(getCurrentIndexSafe(), false);
 	}
 
 	function init() {
-		if (window.lampa_series_skip_manual_runtime_fix) return;
-		window.lampa_series_skip_manual_runtime_fix = true;
+		if (window.lampa_series_skip_production_fix) return;
+		window.lampa_series_skip_production_fix = true;
 
 		const originalPlay = Lampa.Player.play;
 		const originalPlaylist = Lampa.Player.playlist;
@@ -310,9 +410,12 @@
 
 		Lampa.Player.playlist = function (playlist) {
 			pendingPlaylist = playlist;
+
 			if (playlist && Array.isArray(playlist)) {
 				state.playlist = playlist;
+				if (state.db) fillPlaylistAhead();
 			}
+
 			return originalPlaylist.call(this, playlist);
 		};
 
@@ -336,18 +439,22 @@
 						pendingPlaylist = null;
 					}
 
-					bindVideoListener();
 					startObserver();
+					startRuntimeSkipWatcher();
+					startTimelineWatcher();
+					scheduleTimelineRender();
 				})
 				.catch(function () {
 					originalPlay.call(context, videoParams);
-					bindVideoListener();
 					startObserver();
+					startRuntimeSkipWatcher();
+					startTimelineWatcher();
 				});
 		};
 
-		bindVideoListener();
 		startObserver();
+		startRuntimeSkipWatcher();
+		startTimelineWatcher();
 	}
 
 	if (window.Lampa && window.Lampa.Player) {

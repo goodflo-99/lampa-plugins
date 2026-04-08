@@ -66,20 +66,36 @@
 		return { season: defaultSeason, episode: 1 };
 	}
 
-	function fillPlaylist(playlist, dbData, fallbackSeason) {
-		if (!playlist || !Array.isArray(playlist) || !dbData) return;
+	function fillPlaylist(playlist, dbData, currentSeason, currentEpisode, currentUrl) {
+        if (!playlist || !Array.isArray(playlist) || !dbData) return;
 
-		playlist.forEach((item, index) => {
-			const itemSeason = parseInt(item.season || item.s || fallbackSeason || 1);
-			const itemEpisode = parseInt(item.episode || item.e || item.episode_number || (index + 1));
-			const itemSegments = getSegmentsFromDb(dbData, itemSeason, itemEpisode);
+        let currentIndex = -1;
 
-			if (itemSegments && itemSegments.length > 0) {
-				item.segments = item.segments || {};
-				item.segments.skip = itemSegments.slice();
-			}
-		});
-	}
+        if (currentUrl) {
+            currentIndex = playlist.findIndex((item) => item.url && item.url === currentUrl);
+        }
+
+        if (currentIndex < 0) currentIndex = 0;
+
+        playlist.forEach((item, index) => {
+            const itemSeason = parseInt(item.season || item.s || currentSeason || 1);
+
+            const explicitEpisode = parseInt(item.episode || item.e || item.episode_number);
+            const itemEpisode = (!isNaN(explicitEpisode) && explicitEpisode > 0)
+                ? explicitEpisode
+                : Math.max(1, currentEpisode + (index - currentIndex));
+
+            const itemSegments = getSegmentsFromDb(dbData, itemSeason, itemEpisode);
+
+            if (itemSegments && itemSegments.length > 0) {
+                item.segments = item.segments || {};
+                item.segments.skip = itemSegments.slice();
+            } else if (item.segments && item.segments.skip) {
+                delete item.segments.skip;
+                if (!Object.keys(item.segments).length) delete item.segments;
+            }
+        });
+    }
 
 	async function searchAndApply(videoParams) {
 		let card = videoParams.movie || videoParams.card;
@@ -111,15 +127,24 @@
 		if (!dbData) return;
 
 		const segmentsData = getSegmentsFromDb(dbData, season, episode);
-		if (segmentsData && segmentsData.length > 0 && !hasExistingSegments(videoParams)) {
-			videoParams.segments = videoParams.segments || {};
-			videoParams.segments.skip = segmentsData.slice();
-			Lampa.Noty.show("Таймкоди завантажено: Сезон " + season + ", Серія " + episode);
-		}
+		if (segmentsData && segmentsData.length > 0) {
+            videoParams.segments = videoParams.segments || {};
+            videoParams.segments.skip = segmentsData.slice();
+            Lampa.Noty.show("Таймкоди завантажено: Сезон " + season + ", Серія " + episode);
+        } else if (videoParams.segments && videoParams.segments.skip) {
+            delete videoParams.segments.skip;
+            if (!Object.keys(videoParams.segments).length) delete videoParams.segments;
+        }
 
 		if (videoParams.playlist && Array.isArray(videoParams.playlist)) {
-			fillPlaylist(videoParams.playlist, dbData, season);
-		}
+            fillPlaylist(
+                videoParams.playlist,
+                dbData,
+                season,
+                episode,
+                videoParams.url
+            );
+        }
 	}
 
 	function init() {

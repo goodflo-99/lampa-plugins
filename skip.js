@@ -1,233 +1,255 @@
 (function () {
-    "use strict";
+	"use strict";
 
-    const GITHUB_DB_URL = "https://raw.githubusercontent.com/ipavlin98/lmp-series-skip-db/refs/heads/main/database/";
+	const GITHUB_DB_URL = "https://raw.githubusercontent.com/ipavlin98/lmp-series-skip-db/refs/heads/main/database/";
 
-    // ── Стан між серіями ──────────────────────────────────────────────────────
-    let cachedKpId    = null;
-    let cachedDbData  = null;
-    let cachedCard    = null;
-    let cachedSeason  = 1;
-    let trackedPlaylist     = null;
-    let trackedStartEpisode = 1;
+	let cache = {
+		kpId: null,
+		card: null,
+		db: null,
+		playlist: null,
+		lastUrl: null,
+		lastIndex: -1,
+		startEpisode: 1,
+		season: 1,
+		observerStarted: false
+	};
 
-    // ── Утиліти ───────────────────────────────────────────────────────────────
-    function hasExistingSegments(obj) {
-        return obj && obj.segments && obj.segments.skip && obj.segments.skip.length > 0;
-    }
+	function hasExistingSegments(obj) {
+		return obj && obj.segments && Array.isArray(obj.segments.skip) && obj.segments.skip.length > 0;
+	}
 
-    function getSegmentsFromDb(dbData, season, episode) {
-        if (!dbData) return null;
-        const s = String(season), e = String(episode);
-        if (dbData[s] && dbData[s][e]) return dbData[s][e];
-        if (s === "1" && e === "1" && dbData.movie) return dbData.movie;
-        if (dbData.movie) return dbData.movie;
-        return null;
-    }
+	function getKpId(card) {
+		if (!card) return null;
+		return card.kinopoisk_id || (card.source === "kinopoisk" ? card.id : null) || card.kp_id;
+	}
 
-    async function fetchFromGitHub(kpId) {
-        try {
-            const resp = await fetch(`${GITHUB_DB_URL}${kpId}.json`);
-            return resp.ok ? await resp.json() : null;
-        } catch (e) { return null; }
-    }
+	function getSegmentsFromDb(dbData, season, episode) {
+		if (!dbData) return null;
 
-    // Розраховуємо початковий номер серії (для плейлистів середини сезону)
-    function calcStartEpisode(playlist) {
-        if (!playlist || !playlist.length) return 1;
-        for (let i = 0; i < playlist.length; i++) {
-            const ep = parseInt(playlist[i].episode || playlist[i].e || playlist[i].episode_number);
-            if (ep > 0) return Math.max(1, ep - i);
-        }
-        return 1;
-    }
+		const s = String(season);
+		const e = String(episode);
 
-    // Визначаємо поточну позицію (сезон/серія) з різних джерел
-    function detectPosition(params) {
-        // Пріоритет 1: явні поля episode/season на videoParams
-        if (params.episode || params.e || params.episode_number) {
-            return {
-                season:  parseInt(params.season  || params.s  || cachedSeason || 1),
-                episode: parseInt(params.episode || params.e  || params.episode_number),
-            };
-        }
-        // Пріоритет 2: пошук URL у playlist (videoParams або trackedPlaylist)
-        const playlist = (params.playlist && Array.isArray(params.playlist) ? params.playlist : null)
-                      || trackedPlaylist;
-        if (playlist && params.url) {
-            const idx = playlist.findIndex(p => typeof p.url === 'string' && p.url === params.url);
-            if (idx !== -1) {
-                const item    = playlist[idx];
-                const startEp = calcStartEpisode(playlist);
-                return {
-                    season:  parseInt(item.season || item.s || cachedSeason || 1),
-                    episode: parseInt(item.episode || item.e || item.episode_number) || (startEp + idx),
-                };
-            }
-        }
-        return { season: cachedSeason || 1, episode: 1 };
-    }
+		if (dbData[s] && dbData[s][e]) return dbData[s][e];
+		if (s === "1" && e === "1" && dbData.movie) return dbData.movie;
+		if (dbData.movie) return dbData.movie;
 
-    // Синхронно отримує сегменти з кешу для конкретного item + index
-    function getSegsForItem(item, index) {
-        if (!cachedDbData) return null;
-        const s  = parseInt(item.season || item.s || cachedSeason || 1);
-        const ep = parseInt(item.episode || item.e || item.episode_number)
-                || (trackedStartEpisode + index);
-        return getSegmentsFromDb(cachedDbData, s, ep) || null;
-    }
+		return null;
+	}
 
-    // ── Основна функція ───────────────────────────────────────────────────────
-    async function searchAndApply(videoParams) {
-        let card = videoParams.movie || videoParams.card;
-        if (!card) {
-            try { const a = Lampa.Activity.active(); if (a) card = a.movie || a.card; } catch (e) {}
-        }
-        if (!card && cachedCard) card = cachedCard;
-        if (!card) return;
+	async function fetchFromGitHub(kpId) {
+		try {
+			const response = await fetch(`${GITHUB_DB_URL}${kpId}.json`);
+			return response.ok ? await response.json() : null;
+		} catch (e) {
+			return null;
+		}
+	}
 
-        const kpId = card.kinopoisk_id || (card.source === "kinopoisk" ? card.id : null) || card.kp_id;
-        if (!kpId) return;
+	function calcStartEpisode(playlist) {
+		if (!playlist || !playlist.length) return 1;
 
-        const { season, episode } = detectPosition(videoParams);
-        cachedSeason = season;
+		for (let i = 0; i < playlist.length; i++) {
+			const item = playlist[i];
+			const ep = parseInt(item.episode || item.e || item.episode_number);
+			if (!isNaN(ep) && ep > 0) {
+				return Math.max(1, ep - i);
+			}
+		}
+		return 1;
+	}
 
-        const isSerial = card.number_of_seasons > 0 || (card.original_name && !card.original_title);
-        const s = isSerial ? season : 1;
-        const e = isSerial ? episode : 1;
+	function getEpisodeFromItem(item, index) {
+		const ep = parseInt(item.episode || item.e || item.episode_number);
+		if (!isNaN(ep) && ep > 0) return ep;
+		return cache.startEpisode + index;
+	}
 
-        if (hasExistingSegments(videoParams)) return;
+	function getSeasonFromItem(item) {
+		const s = parseInt(item.season || item.s || cache.season || 1);
+		return !isNaN(s) && s > 0 ? s : 1;
+	}
 
-        let dbData;
-        if (kpId === cachedKpId && cachedDbData) {
-            dbData = cachedDbData;
-        } else {
-            dbData = await fetchFromGitHub(kpId);
-            if (dbData) { cachedKpId = kpId; cachedDbData = dbData; cachedCard = card; }
-        }
-        if (!dbData) return;
+	function fillPlaylist(playlist) {
+		if (!playlist || !Array.isArray(playlist) || !cache.db) return;
 
-        const segs = getSegmentsFromDb(dbData, s, e);
-        if (segs && segs.length > 0) {
-            videoParams.segments = { skip: segs.slice() };
-            Lampa.Noty.show("Таймкоди: Сезон " + s + ", Серія " + e);
-        }
+		cache.startEpisode = calcStartEpisode(playlist);
 
-        // Попередньо наповнюємо всі серії плейлиста
-        const list = (videoParams.playlist && Array.isArray(videoParams.playlist))
-            ? videoParams.playlist : trackedPlaylist;
-        if (list) {
-            if (videoParams.playlist) {
-                trackedPlaylist     = videoParams.playlist;
-                trackedStartEpisode = calcStartEpisode(trackedPlaylist);
-            }
-            list.forEach((item, idx) => {
-                if (hasExistingSegments(item)) return;
-                const itemSegs = getSegsForItem(item, idx);
-                if (itemSegs && itemSegs.length > 0) item.segments = { skip: itemSegs.slice() };
-            });
-        }
-    }
+		playlist.forEach((item, index) => {
+			const season = getSeasonFromItem(item);
+			const episode = getEpisodeFromItem(item, index);
+			const segs = getSegmentsFromDb(cache.db, season, episode);
 
-    // ── Ключове виправлення: синхронне застосування в next()/prev() ───────────
-    // Lampa не викликає Player.play() при авто-переході → перехоплюємо тут
-    function applyBeforeNav(targetIndex) {
-        if (!cachedDbData || !trackedPlaylist) return;
-        const item = trackedPlaylist[targetIndex];
-        if (!item) return;
-        // Перезаписуємо навіть якщо сегменти вже є (могли залишитись від попередньої серії)
-        const segs = getSegsForItem(item, targetIndex);
-        if (segs && segs.length > 0) {
-            item.segments = { skip: segs.slice() };
-        } else {
-            // Немає таймкодів — очищаємо, щоб не залишились від попередньої серії
-            if (item.segments) delete item.segments;
-        }
-    }
+			if (segs && segs.length > 0) {
+				item.segments = item.segments || {};
+				item.segments.skip = segs.slice();
+			} else if (item.segments && item.segments.skip) {
+				delete item.segments.skip;
+				if (!Object.keys(item.segments).length) delete item.segments;
+			}
+		});
+	}
 
-    function init() {
-        if (window.lampa_series_skip) return;
-        window.lampa_series_skip = true;
+	function detectCurrentIndex() {
+		if (!cache.playlist || !cache.playlist.length) return -1;
 
-        const originalPlay     = Lampa.Player.play;
-        const originalPlaylist = Lampa.Player.playlist;
-        let pendingPlaylist = null;
+		let idx = cache.playlist.findIndex(item => item.selected);
+		if (idx >= 0) return idx;
 
-        Lampa.Player.playlist = function (playlist) {
-            pendingPlaylist = playlist;
-            if (playlist && Array.isArray(playlist)) {
-                trackedPlaylist     = playlist;
-                trackedStartEpisode = calcStartEpisode(playlist);
-            }
-            originalPlaylist.call(this, playlist);
-        };
+		try {
+			const currentUrl =
+				(Lampa.Player && Lampa.Player.video && (Lampa.Player.video.src || Lampa.Player.video.url)) || null;
 
-        Lampa.Player.play = function (videoParams) {
-            const context = this;
-            if (videoParams.url) Lampa.PlayerPlaylist.url(videoParams.url);
-            if (videoParams.playlist && videoParams.playlist.length > 0)
-                Lampa.PlayerPlaylist.set(videoParams.playlist);
+			if (currentUrl) {
+				idx = cache.playlist.findIndex(item => item.url && item.url === currentUrl);
+				if (idx >= 0) return idx;
+			}
+		} catch (e) {}
 
-            searchAndApply(videoParams)
-                .then(() => {
-                    originalPlay.call(context, videoParams);
-                    if (pendingPlaylist) {
-                        Lampa.PlayerPlaylist.set(pendingPlaylist);
-                        pendingPlaylist = null;
-                    }
-                })
-                .catch(() => originalPlay.call(context, videoParams));
-        };
+		return -1;
+	}
 
-        // ── Перехоплення next()/prev() ─────────────────────────────────────────
-        // Застосовуємо сегменти СИНХРОННО ДО виклику оригінального next/prev,
-        // щоб item.segments вже були встановлені, коли плеєр бере наступний елемент
-        function hookNav(method) {
-            const orig = Lampa.PlayerPlaylist[method];
-            if (typeof orig !== 'function') return;
+	function applyForCurrentItem(forceNotify) {
+		if (!cache.db || !cache.playlist) return;
 
-            Lampa.PlayerPlaylist[method] = function () {
-                if (cachedDbData && trackedPlaylist) {
-                    // Знаходимо індекс поточного елементу (позначений selected:true)
-                    let curIdx = trackedPlaylist.findIndex(i => i.selected);
-                    if (curIdx < 0) {
-                        // Запасний варіант: пошук за URL поточного відео
-                        try {
-                            const curUrl = Lampa.Player.video && Lampa.Player.video.src;
-                            if (curUrl) curIdx = trackedPlaylist.findIndex(i => i.url === curUrl);
-                        } catch (e) {}
-                    }
+		const idx = detectCurrentIndex();
+		if (idx < 0 || !cache.playlist[idx]) return;
 
-                    const delta    = method === 'next' ? 1 : -1;
-                    const targetIdx = curIdx >= 0
-                        ? curIdx + delta
-                        : (method === 'next' ? 0 : trackedPlaylist.length - 1);
+		const item = cache.playlist[idx];
+		const season = getSeasonFromItem(item);
+		const episode = getEpisodeFromItem(item, idx);
+		const segs = getSegmentsFromDb(cache.db, season, episode);
 
-                    applyBeforeNav(targetIdx);
-                }
-                return orig.apply(this, arguments);
-            };
-        }
-        hookNav('next');
-        hookNav('prev');
+		if (segs && segs.length > 0) {
+			item.segments = item.segments || {};
+			item.segments.skip = segs.slice();
 
-        // ── Додатковий рівень: події плеєра ───────────────────────────────────
-        Lampa.Listener.follow('player', function (e) {
-            if (e.type === 'next' || e.type === 'prev') {
-                // Якщо play() все ж викликається — searchAndApply обробить через кеш
-                // Якщо ні — hookNav вже застосував сегменти
-            }
-            // Проактивне застосування: коли серія закінчилась, готуємо наступну
-            if (e.type === 'ended' && trackedPlaylist && cachedDbData) {
-                const curIdx = trackedPlaylist.findIndex(i => i.selected);
-                if (curIdx >= 0) applyBeforeNav(curIdx + 1);
-            }
-        });
-    }
+			try {
+				if (Lampa.Player && Lampa.Player.object) {
+					Lampa.Player.object.segments = Lampa.Player.object.segments || {};
+					Lampa.Player.object.segments.skip = segs.slice();
+				}
+			} catch (e) {}
 
-    if (window.Lampa && window.Lampa.Player) {
-        init();
-    } else {
-        window.document.addEventListener("app_ready", init);
-    }
+			if (forceNotify) {
+				Lampa.Noty.show("Таймкоди: Сезон " + season + ", Серія " + episode);
+			}
+		} else {
+			if (item.segments && item.segments.skip) {
+				delete item.segments.skip;
+				if (!Object.keys(item.segments).length) delete item.segments;
+			}
+
+			try {
+				if (Lampa.Player && Lampa.Player.object && Lampa.Player.object.segments) {
+					delete Lampa.Player.object.segments.skip;
+				}
+			} catch (e) {}
+		}
+
+		cache.lastIndex = idx;
+		cache.lastUrl = item.url || null;
+	}
+
+	function startObserver() {
+		if (cache.observerStarted) return;
+		cache.observerStarted = true;
+
+		setInterval(function () {
+			if (!cache.db || !cache.playlist || !cache.playlist.length) return;
+
+			const idx = detectCurrentIndex();
+			if (idx < 0 || !cache.playlist[idx]) return;
+
+			const currentUrl = cache.playlist[idx].url || null;
+
+			if (idx !== cache.lastIndex || currentUrl !== cache.lastUrl) {
+				applyForCurrentItem(true);
+			}
+		}, 700);
+	}
+
+	async function searchAndApply(videoParams) {
+		let card = videoParams.movie || videoParams.card;
+
+		if (!card) {
+			try {
+				const active = Lampa.Activity.active();
+				if (active) card = active.movie || active.card;
+			} catch (e) {}
+		}
+
+		if (!card && cache.card) card = cache.card;
+		if (!card) return;
+
+		const kpId = getKpId(card);
+		if (!kpId) return;
+
+		cache.card = card;
+
+		const season = parseInt(videoParams.season || videoParams.s || 1) || 1;
+		cache.season = season;
+
+		if (kpId !== cache.kpId || !cache.db) {
+			cache.db = await fetchFromGitHub(kpId);
+			cache.kpId = kpId;
+		}
+
+		if (!cache.db) return;
+
+		if (videoParams.playlist && Array.isArray(videoParams.playlist)) {
+			cache.playlist = videoParams.playlist;
+			fillPlaylist(cache.playlist);
+		}
+
+		if (videoParams.url && cache.playlist) {
+			const idx = cache.playlist.findIndex(item => item.url === videoParams.url);
+			if (idx >= 0) {
+				cache.lastIndex = -1;
+				cache.lastUrl = null;
+				applyForCurrentItem(true);
+			}
+		}
+
+		startObserver();
+	}
+
+	function init() {
+		if (window.lampa_series_skip_fix_v2) return;
+		window.lampa_series_skip_fix_v2 = true;
+
+		const originalPlay = Lampa.Player.play;
+		const originalPlaylist = Lampa.Player.playlist;
+
+		Lampa.Player.playlist = function (playlist) {
+			if (playlist && Array.isArray(playlist)) {
+				cache.playlist = playlist;
+				if (cache.db) fillPlaylist(playlist);
+			}
+			return originalPlaylist.apply(this, arguments);
+		};
+
+		Lampa.Player.play = function (videoParams) {
+			const context = this;
+
+			searchAndApply(videoParams)
+				.then(function () {
+					originalPlay.call(context, videoParams);
+					setTimeout(function () {
+						applyForCurrentItem(false);
+					}, 300);
+				})
+				.catch(function () {
+					originalPlay.call(context, videoParams);
+				});
+		};
+
+		startObserver();
+	}
+
+	if (window.Lampa && window.Lampa.Player) {
+		init();
+	} else {
+		window.document.addEventListener("app_ready", init);
+	}
 })();

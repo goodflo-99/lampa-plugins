@@ -6,15 +6,19 @@
 
 	const state = {
 		kpId: null,
-		db: null,
 		card: null,
+		db: null,
 		playlist: null,
-		currentSeason: 1,
-		currentEpisode: 1,
+		baseSeason: 1,
+		baseEpisode: 1,
+		baseIndex: 0,
 		lastIndex: -1,
 		lastUrl: null,
-		lastAppliedKey: null,
-		observer: null
+		activeEpisodeKey: null,
+		activeSegments: [],
+		skippedMarks: {},
+		videoBound: false,
+		observerStarted: false
 	};
 
 	function hasExistingSegments(obj) {
@@ -52,43 +56,58 @@
 		}
 	}
 
-	function debugBox() {
-		let box = document.getElementById("skip-debug-box");
+	function normalizeSegments(raw) {
+		if (!Array.isArray(raw)) return [];
 
-		if (!box) {
-			box = document.createElement("div");
-			box.id = "skip-debug-box";
-			box.style.cssText = [
-				"position:fixed",
-				"top:1.2em",
-				"right:1.2em",
-				"z-index:999999",
-				"background:rgba(0,0,0,.78)",
-				"color:#fff",
-				"padding:0.7em 0.9em",
-				"border-radius:0.6em",
-				"font-size:1.05em",
-				"line-height:1.35",
-				"max-width:46vw",
-				"white-space:pre-line",
-				"pointer-events:none"
-			].join(";");
+		return raw.map(function (seg, index) {
+			let start = null;
+			let end = null;
 
-			document.body.appendChild(box);
+			if (Array.isArray(seg)) {
+				start = Number(seg[0]);
+				end = Number(seg[1]);
+			} else if (seg && typeof seg === "object") {
+				start = Number(
+					seg.start ?? seg.from ?? seg.begin ?? seg.time ?? seg[0]
+				);
+				end = Number(
+					seg.end ?? seg.to ?? seg.stop ?? seg[1]
+				);
+			}
+
+			if (!isFinite(start) || !isFinite(end)) return null;
+			if (end <= start) return null;
+
+			return {
+				id: index,
+				start: start,
+				end: end
+			};
+		}).filter(Boolean);
+	}
+
+	function detectPosition(videoParams, defaultSeason) {
+		if (videoParams.episode || videoParams.e || videoParams.episode_number) {
+			return {
+				season: parseInt(videoParams.season || videoParams.s || defaultSeason || 1),
+				episode: parseInt(videoParams.episode || videoParams.e || videoParams.episode_number)
+			};
 		}
 
-		return box;
-	}
+		if (videoParams.playlist && Array.isArray(videoParams.playlist) && videoParams.url) {
+			const index = videoParams.playlist.findIndex((p) => p.url && p.url === videoParams.url);
 
-	function showDebug(lines) {
-		const box = debugBox();
-		box.textContent = Array.isArray(lines) ? lines.join("\n") : String(lines);
-	}
+			if (index !== -1) {
+				const item = videoParams.playlist[index];
+				return {
+					season: parseInt(item.season || item.s || defaultSeason || 1),
+					episode: parseInt(item.episode || item.e || item.episode_number || (index + 1)),
+					index: index
+				};
+			}
+		}
 
-	function shortNoty(text) {
-		try {
-			Lampa.Noty.show(text);
-		} catch (e) {}
+		return { season: defaultSeason || 1, episode: 1, index: 0 };
 	}
 
 	function detectCurrentUrl() {
@@ -114,107 +133,102 @@
 		return -1;
 	}
 
-	function detectPosition(videoParams, defaultSeason = 1) {
-		if (videoParams.episode || videoParams.e || videoParams.episode_number) {
-			return {
-				season: parseInt(videoParams.season || videoParams.s || defaultSeason || 1),
-				episode: parseInt(videoParams.episode || videoParams.e || videoParams.episode_number)
-			};
-		}
+	function getEpisodeInfoByIndex(index) {
+		if (!state.playlist || !state.playlist[index]) return null;
 
-		if (videoParams.playlist && Array.isArray(videoParams.playlist) && videoParams.url) {
-			const index = videoParams.playlist.findIndex((p) => p.url && p.url === videoParams.url);
-			if (index !== -1) {
-				const item = videoParams.playlist[index];
-				return {
-					season: parseInt(item.season || item.s || defaultSeason || 1),
-					episode: parseInt(item.episode || item.e || item.episode_number || (index + 1))
-				};
-			}
-		}
+		const item = state.playlist[index];
+		const season = parseInt(item.season || item.s || state.baseSeason || 1);
 
-		return { season: defaultSeason, episode: 1 };
-	}
-
-	function fillPlaylistRelative(playlist, dbData, currentSeason, currentEpisode, currentUrl) {
-		if (!playlist || !Array.isArray(playlist) || !dbData) return;
-
-		let currentIndex = playlist.findIndex(item => item && item.url && item.url === currentUrl);
-		if (currentIndex < 0) currentIndex = 0;
-
-		playlist.forEach((item, index) => {
-			if (!item) return;
-
-			const itemSeason = parseInt(item.season || item.s || currentSeason || 1);
-			const explicitEpisode = parseInt(item.episode || item.e || item.episode_number);
-			const itemEpisode = (!isNaN(explicitEpisode) && explicitEpisode > 0)
-				? explicitEpisode
-				: Math.max(1, currentEpisode + (index - currentIndex));
-
-			const segs = getSegmentsFromDb(dbData, itemSeason, itemEpisode);
-
-			if (segs && segs.length > 0) {
-				item.segments = item.segments || {};
-				item.segments.skip = segs.slice();
-			} else if (item.segments && item.segments.skip) {
-				delete item.segments.skip;
-				if (!Object.keys(item.segments).length) delete item.segments;
-			}
-		});
-	}
-
-	function applyCurrentFromState(silent) {
-		const idx = detectCurrentIndex();
-		const url = detectCurrentUrl();
-
-		if (idx < 0 || !state.playlist || !state.playlist[idx] || !state.db) {
-			showDebug([
-				"IDX: " + idx,
-				"URL: " + (url ? "yes" : "no"),
-				"DB: " + (!!state.db),
-				"PLAYLIST: " + (!!state.playlist)
-			]);
-			return;
-		}
-
-		const item = state.playlist[idx];
-		const season = parseInt(item.season || item.s || state.currentSeason || 1);
 		const explicitEpisode = parseInt(item.episode || item.e || item.episode_number);
 		const episode = (!isNaN(explicitEpisode) && explicitEpisode > 0)
 			? explicitEpisode
-			: Math.max(1, state.currentEpisode + (idx - Math.max(0, state.lastIndex < 0 ? idx : state.lastIndex)));
+			: Math.max(1, state.baseEpisode + (index - state.baseIndex));
 
-		const segs = getSegmentsFromDb(state.db, season, episode);
-		const applyKey = idx + "|" + season + "|" + episode + "|" + (url || "");
+		return {
+			item: item,
+			season: season,
+			episode: episode
+		};
+	}
 
-		if (segs && segs.length > 0) {
-			item.segments = item.segments || {};
-			item.segments.skip = segs.slice();
-		} else if (item.segments && item.segments.skip) {
-			delete item.segments.skip;
-			if (!Object.keys(item.segments).length) delete item.segments;
+	function setSegmentsForCurrentEpisode(index, notify) {
+		const info = getEpisodeInfoByIndex(index);
+		if (!info || !state.db) return;
+
+		const rawSegments = getSegmentsFromDb(state.db, info.season, info.episode);
+		const normalized = normalizeSegments(rawSegments);
+		const episodeKey = info.season + "|" + info.episode + "|" + index;
+
+		state.activeEpisodeKey = episodeKey;
+		state.activeSegments = normalized;
+		state.skippedMarks = {};
+
+		if (rawSegments && rawSegments.length > 0) {
+			info.item.segments = info.item.segments || {};
+			info.item.segments.skip = rawSegments.slice();
+		} else if (info.item.segments && info.item.segments.skip) {
+			delete info.item.segments.skip;
+			if (!Object.keys(info.item.segments).length) delete info.item.segments;
 		}
 
-		showDebug([
-			"IDX: " + idx,
-			"S/E: " + season + "/" + episode,
-			"URL: " + (url ? "yes" : "no"),
-			"SEG: " + (segs && segs.length > 0 ? "yes (" + segs.length + ")" : "no"),
-			"ITEM_EP: " + (item.episode || item.e || item.episode_number || "fallback"),
-			"NEXT: " + (!!(state.playlist[idx + 1]))
-		]);
-
-		if (!silent && state.lastAppliedKey !== applyKey) {
-			state.lastAppliedKey = applyKey;
-			shortNoty("DEBUG S" + season + "E" + episode + " SEG " + (segs && segs.length ? "YES" : "NO"));
+		if (notify) {
+			Lampa.Noty.show(
+				"Таймкоди: Сезон " + info.season + ", Серія " + info.episode + " — " + (normalized.length ? "OK" : "немає")
+			);
 		}
 	}
 
-	function startObserver() {
-		if (state.observer) return;
+	function bindVideoListener() {
+		if (state.videoBound) return;
 
-		state.observer = setInterval(function () {
-			if (!state.playlist || !state.playlist.length) return;
+		const tryBind = function () {
+			try {
+				const video = Lampa.Player && Lampa.Player.video;
+				if (!video || typeof video.addEventListener !== "function") {
+					setTimeout(tryBind, 500);
+					return;
+				}
+
+				video.addEventListener("timeupdate", function () {
+					if (!state.activeSegments || !state.activeSegments.length) return;
+					if (!state.activeEpisodeKey) return;
+
+					const currentTime = Number(video.currentTime || 0);
+					if (!isFinite(currentTime)) return;
+
+					for (let i = 0; i < state.activeSegments.length; i++) {
+						const seg = state.activeSegments[i];
+						const markKey = state.activeEpisodeKey + "|" + seg.id;
+
+						if (state.skippedMarks[markKey]) continue;
+
+						if (currentTime >= seg.start && currentTime < seg.end - 0.2) {
+							state.skippedMarks[markKey] = true;
+
+							try {
+								video.currentTime = seg.end + 0.05;
+							} catch (e) {}
+
+							break;
+						}
+					}
+				});
+
+				state.videoBound = true;
+			} catch (e) {
+				setTimeout(tryBind, 500);
+			}
+		};
+
+		tryBind();
+	}
+
+	function startObserver() {
+		if (state.observerStarted) return;
+		state.observerStarted = true;
+
+		setInterval(function () {
+			if (!state.playlist || !state.playlist.length || !state.db) return;
 
 			const idx = detectCurrentIndex();
 			const url = detectCurrentUrl();
@@ -222,9 +236,12 @@
 			if (idx !== state.lastIndex || url !== state.lastUrl) {
 				state.lastIndex = idx;
 				state.lastUrl = url;
-				applyCurrentFromState(false);
+
+				if (idx >= 0) {
+					setSegmentsForCurrentEpisode(idx, true);
+				}
 			}
-		}, 800);
+		}, 700);
 	}
 
 	async function searchAndApply(videoParams) {
@@ -236,6 +253,7 @@
 				if (active) card = active.movie || active.card;
 			} catch (e) {}
 		}
+
 		if (!card) return;
 
 		const kpId = getKpId(card);
@@ -245,42 +263,46 @@
 		state.kpId = kpId;
 
 		const pos = detectPosition(videoParams, 1);
-		state.currentSeason = pos.season;
-		state.currentEpisode = pos.episode;
+		state.baseSeason = pos.season || 1;
+		state.baseEpisode = pos.episode || 1;
+		state.baseIndex = pos.index || 0;
 
 		state.db = await fetchFromGitHub(kpId);
-
-		showDebug([
-			"INIT",
-			"KP: " + (kpId || "no"),
-			"DB: " + (!!state.db),
-			"S/E: " + pos.season + "/" + pos.episode
-		]);
-
-		if (!state.db) {
-			shortNoty("DEBUG: DB not found");
-			return;
-		}
+		if (!state.db) return;
 
 		if (videoParams.playlist && Array.isArray(videoParams.playlist)) {
 			state.playlist = videoParams.playlist;
-			fillPlaylistRelative(videoParams.playlist, state.db, pos.season, pos.episode, videoParams.url);
 		}
 
-		const segs = getSegmentsFromDb(state.db, pos.season, pos.episode);
+		const rawSegments = getSegmentsFromDb(state.db, state.baseSeason, state.baseEpisode);
 
-		if (segs && segs.length > 0) {
+		if (rawSegments && rawSegments.length > 0) {
 			videoParams.segments = videoParams.segments || {};
-			videoParams.segments.skip = segs.slice();
-			shortNoty("START S" + pos.season + "E" + pos.episode + " YES");
+			videoParams.segments.skip = rawSegments.slice();
+
+			state.activeSegments = normalizeSegments(rawSegments);
+			state.activeEpisodeKey = state.baseSeason + "|" + state.baseEpisode + "|" + state.baseIndex;
+			state.skippedMarks = {};
+
+			Lampa.Noty.show("Таймкоди завантажено: Сезон " + state.baseSeason + ", Серія " + state.baseEpisode);
 		} else {
-			shortNoty("START S" + pos.season + "E" + pos.episode + " NO");
+			state.activeSegments = [];
+			state.activeEpisodeKey = state.baseSeason + "|" + state.baseEpisode + "|" + state.baseIndex;
+			state.skippedMarks = {};
+		}
+
+		if (state.playlist && state.playlist[state.baseIndex]) {
+			const item = state.playlist[state.baseIndex];
+			if (rawSegments && rawSegments.length > 0) {
+				item.segments = item.segments || {};
+				item.segments.skip = rawSegments.slice();
+			}
 		}
 	}
 
 	function init() {
-		if (window.lampa_series_skip_screen_debug) return;
-		window.lampa_series_skip_screen_debug = true;
+		if (window.lampa_series_skip_manual_runtime_fix) return;
+		window.lampa_series_skip_manual_runtime_fix = true;
 
 		const originalPlay = Lampa.Player.play;
 		const originalPlaylist = Lampa.Player.playlist;
@@ -288,7 +310,9 @@
 
 		Lampa.Player.playlist = function (playlist) {
 			pendingPlaylist = playlist;
-			state.playlist = playlist;
+			if (playlist && Array.isArray(playlist)) {
+				state.playlist = playlist;
+			}
 			return originalPlaylist.call(this, playlist);
 		};
 
@@ -304,7 +328,7 @@
 			}
 
 			searchAndApply(videoParams)
-				.then(() => {
+				.then(function () {
 					originalPlay.call(context, videoParams);
 
 					if (pendingPlaylist) {
@@ -312,19 +336,18 @@
 						pendingPlaylist = null;
 					}
 
+					bindVideoListener();
 					startObserver();
-
-					setTimeout(function () {
-						applyCurrentFromState(true);
-					}, 600);
 				})
-				.catch(() => {
+				.catch(function () {
 					originalPlay.call(context, videoParams);
+					bindVideoListener();
+					startObserver();
 				});
 		};
 
+		bindVideoListener();
 		startObserver();
-		showDebug("WAIT PLAYER...");
 	}
 
 	if (window.Lampa && window.Lampa.Player) {
